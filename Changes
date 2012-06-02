@@ -2,6 +2,11 @@
 
 Changes - List of significant changes to DBIx::Pg::CallFunction
 
+=head2 Changes in 0.006
+  Optimized _proretset SQL query
+  Makefile.PL format changed to Module::Install
+  Add script pg_proc_jsonrpcd, starting a JSON-RPC daemon
+
 =head2 Changes in 0.005
 
   Added Plack PSGI example on how to create a JSON-RPC server,
