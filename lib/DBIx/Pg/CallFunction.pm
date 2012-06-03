@@ -1,5 +1,5 @@
 package DBIx::Pg::CallFunction;
-our $VERSION = '0.007';
+our $VERSION = '0.008';
 use 5.008;
 
 =head1 NAME
@@ -8,7 +8,7 @@ DBIx::Pg::CallFunction - Simple interface for calling PostgreSQL functions from 
 
 =head1 VERSION
 
-version 0.007
+version 0.008
 
 =head1 SYNOPSIS
 
@@ -47,6 +47,28 @@ complexity, as multiple functions in PostgreSQL can share the same name,
 but with different input argument types.
 
 Please see L<pg_proc_jsonrpc.psgi> for an example on how to use this module.
+
+=head1 CONSTRUCTOR METHODS
+
+The following constructor methods are available:
+
+=over 4
+
+=item my $pg = DBIx::Pg::CallFunction->new($dbh)
+
+This method constructs a new C<DBIx::Pg::CallFunction> object and returns it.
+
+=back
+
+=head1 REQUEST METHODS
+
+=over 4
+
+=item my $output = $pg->$name_of_stored_procedure($hashref_of_input_arguments)
+
+=item my $output = $pg->$name_of_stored_procedure($hashref_of_input_arguments, $namespace)
+
+=back
 
 =head1 SEE ALSO
 
@@ -120,12 +142,13 @@ sub new
 
 sub AUTOLOAD
 {
-    my $self   = shift;
-    my $args   = shift;
+    my $self      = shift;
+    my $args      = shift;
+    my $namespace = shift;
     my $name   = $AUTOLOAD;
     return if ($name =~ /DESTROY$/);
     $name =~ s!^.*::([^:]+)$!$1!;
-    return $self->call($name, $args);
+    return $self->_call($name, $args, $namespace);
 }
 
 sub _proretset
@@ -238,7 +261,7 @@ sub _proretset
     }
 }
 
-sub call
+sub _call
 {
     my ($self,$name,$args,$namespace) = @_;
 
@@ -322,7 +345,7 @@ sub call
 
 =begin Pod::Coverage
 
-call
+new
 
 =end Pod::Coverage
 

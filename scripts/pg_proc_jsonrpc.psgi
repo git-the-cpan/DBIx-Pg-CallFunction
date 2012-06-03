@@ -63,7 +63,7 @@ my $app = sub {
 
     my $dbh = DBI->connect("dbi:Pg:service=pg_proc_jsonrpc", '', '', {pg_enable_utf8 => 1}) or die "unable to connect to PostgreSQL";
     my $pg = DBIx::Pg::CallFunction->new($dbh);
-    my $result = $pg->call($function_name, $params, $namespace);
+    my $result = $pg->$function_name($params, $namespace);
     $dbh->disconnect;
 
     my $response = {
@@ -101,12 +101,11 @@ Instructions for a clean installation of Ubuntu 12.04 LTS.
 
 Install necessary packages
 
-  sudo apt-get install postgresql-9.1 libplack-perl libdbd-pg-perl libjson-perl libmodule-install-perl libtest-exception-perl libapache2-mod-perl2
-  sudo cpan DBIx::Pg::CallFunction
+  sudo apt-get install cpanminus build-essential postgresql-9.1 libplack-perl libdbd-pg-perl libjson-perl libmodule-install-perl libtest-exception-perl libapache2-mod-perl2
 
 Create a database and database user for our shell user
 
-  sudo -u postgres createuser --no-superuser --no-createrole --no-createdb $USER
+  sudo -u postgres createuser --no-superuser --no-createrole --createdb $USER
   sudo -u postgres createdb --owner=$USER $USER
 
 Try to connect
@@ -120,6 +119,10 @@ Try to connect
 Create database user for apache
 
   sudo -u postgres createuser --no-superuser --no-createrole --no-createdb www-data
+
+Download and build DBIx::Pg::CallFunction
+
+  cpanm --sudo DBIx::Pg::CallFunction
 
 Grant access to connect to our database
 
@@ -156,14 +159,14 @@ Configure Apache
 
 Restart Apache
 
-  service apache2 restart
+  sudo service apache2 restart
 
 Done!
 
-You can now access PostgreSQL Stored Procedures at
-http://127.0.0.1/postgres using any JSON-RPC client,
+You can now access PostgreSQL Stored Procedures, e.g.
+L<http://127.0.0.1/postgres/now> using any JSON-RPC client,
 such as a web browser, some Perl program, or
-any application capable of talking HTTP.
+any application capable of talking HTTP and JSON-RPC.
 
 Let's try it with an example!
 
@@ -249,25 +252,25 @@ However, when developing for real ALWAYS use POST and
 set Content-Type to application/json.
 
 
-  http://127.0.0.1/postgres/new_user_comment?_username=joel&_comment=Accessing PostgreSQL from a browser is easy!
+  L<http://127.0.0.1/postgres/new_user_comment?_username=joel&_comment=Accessing PostgreSQL from a browser is easy!>
   {
      "error" : null,
      "result" : "1"
   }
   
-  http://127.0.0.1/postgres/new_user_comment?_username=lukas&_comment=I must agree! Also easy from JQuery!
+  L<http://127.0.0.1/postgres/new_user_comment?_username=lukas&_comment=I must agree! Also easy from JQuery!>
   {
      "error" : null,
      "result" : "2"
   }
   
-  http://127.0.0.1/postgres/new_user_comment?_username=claes&_comment=Or using JSON::RPC::Simple :)
+  L<http://127.0.0.1/postgres/new_user_comment?_username=claes&_comment=Or using JSON::RPC::Simple>
   {
      "error" : null,
      "result" : "3"
   }
   
-  http://127.0.0.1/postgres/get_all_comments
+  L<http://127.0.0.1/postgres/get_all_comments>
   {
      "error" : null,
      "result" : [
