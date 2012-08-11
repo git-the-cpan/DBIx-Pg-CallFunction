@@ -1,5 +1,5 @@
 package DBIx::Pg::CallFunction;
-our $VERSION = '0.011';
+our $VERSION = '0.012';
 use 5.008;
 
 =head1 NAME
@@ -8,7 +8,7 @@ DBIx::Pg::CallFunction - Simple interface for calling PostgreSQL functions from 
 
 =head1 VERSION
 
-version 0.011
+version 0.012
 
 =head1 SYNOPSIS
 
@@ -294,8 +294,9 @@ sub _call
 
     my $proretset = $self->_proretset($name, \@arg_names, $namespace);
 
+    local $self->{dbh}->{RaiseError} = 0;
     my $query = $self->{dbh}->prepare($sql);
-    $query->execute(@arg_values);
+    $query->execute(@arg_values) or croak "Call to $name failed: $DBI::errstr";
 
     my $output;
     my $num_cols;
