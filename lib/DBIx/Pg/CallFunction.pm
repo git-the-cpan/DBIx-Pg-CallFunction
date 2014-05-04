@@ -1,5 +1,5 @@
 package DBIx::Pg::CallFunction;
-our $VERSION = '0.012';
+our $VERSION = '0.014';
 use 5.008;
 
 =head1 NAME
@@ -8,7 +8,7 @@ DBIx::Pg::CallFunction - Simple interface for calling PostgreSQL functions from 
 
 =head1 VERSION
 
-version 0.012
+version 0.014
 
 =head1 SYNOPSIS
 
@@ -54,9 +54,31 @@ The following constructor methods are available:
 
 =over 4
 
-=item my $pg = DBIx::Pg::CallFunction->new($dbh)
+=item my $pg = DBIx::Pg::CallFunction->new($dbh, [$hashref])
 
 This method constructs a new C<DBIx::Pg::CallFunction> object and returns it.
+
+$dbh is a handle to your database connection.
+
+$hashref is an optional reference to a hash containing configuration parameters.
+If it not present, the default values will be used.
+
+=back
+
+=head2 CONFIGURATION PARAMETERS
+
+The following configuration parameters are available:
+
+=over 4
+
+=item EnableFunctionLookupCache
+
+When enabled, the procedure returns set for each function will be cached.
+This is disabled by default.
+
+=item RaiseError
+
+By default, this is enabled. It is used like L<DBI/RaiseError>.
 
 =back
 
@@ -134,10 +156,35 @@ sub new
     my $class = shift;
     my $self =
     {
-        dbh => shift
+        dbh => shift,
+        RaiseError => 1,
+        EnableFunctionLookupCache => 0,
+
+        prosetret_cache => {}
     };
+
+    my $params = shift;
+    if (defined $params)
+    {
+        $self->{RaiseError} = delete $params->{RaiseError} if exists $params->{RaiseError};
+        $self->{EnableFunctionLookupCache} = delete $params->{EnableFunctionLookupCache} if exists $params->{EnableFunctionLookupCache};
+
+        # If there were any unrecognized parameters left, report one of them
+        if (scalar keys %{$params} > 0)
+        {
+            my $param = shift @{keys %{$params}};
+            croak "unrecognized parameter $param";
+        }
+    }
+
     bless $self, $class;
     return $self;
+}
+
+sub set_dbh
+{
+    my ($self, $dbh) = @_;
+    $self->{dbh} = $dbh;
 }
 
 sub AUTOLOAD
@@ -151,6 +198,33 @@ sub AUTOLOAD
     return $self->_call($name, $args, $namespace);
 }
 
+# Calculates a cache key for a function, given its signature.
+#
+# The caller should sort  $argnames  before passing them to us.
+sub _calculate_proretset_cache_key
+{
+    my ($self, $name, $argnames, $namespace) = @_;
+
+    return (defined $namespace ? $namespace : "").".".
+            $name."(".join(",", @{$argnames}).")";
+}
+
+
+# Because there is no way for us to do "proper" cache invalidation, we have to
+# rely on detecting the SQLSTATEs of the cases where the cache entry might be
+# stale.  Currently, these cases are:
+#
+#   1) A cached function gets dropped.  (SQLSTATE undefined_function)
+#   2) A new function with the same signature is introduced (SQLSTATE
+#      ambiguous_function)
+sub _invalidate_proretset_cache_entry
+{
+    my ($self, $name, $argnames, $namespace) = @_;
+
+    my $cachekey = $self->_calculate_proretset_cache_key($name, $argnames, $namespace);
+    delete $self->{proretset_cache}->{$cachekey};
+}
+
 sub _proretset
 {
     # Returns the value of pg_catalog.pg_proc.proretset for the function.
@@ -158,6 +232,19 @@ sub _proretset
     # If 1, the function returns multiple rows, or zero rows.
     # If 0, the function always returns exactly one row.
     my ($self, $name, $argnames, $namespace) = @_;
+
+    my $cachekey = undef;
+
+    # do a cache lookup if the caller asked for that
+    if ($self->{EnableFunctionLookupCache})
+    {
+        $cachekey = $self->_calculate_proretset_cache_key($name, $argnames, $namespace);
+        if (exists ($self->{proretset_cache}->{$cachekey}))
+        {
+            my $cached = $self->{proretset_cache}->{$cachekey};
+            return $cached;
+        }
+    }
 
     my $get_proretset;
     if (@$argnames == 0)
@@ -191,12 +278,13 @@ sub _proretset
                     pg_catalog.pg_proc.oid,
                     pg_catalog.pg_proc.proname,
                     pg_catalog.pg_proc.proretset,
+                    pg_catalog.pg_proc.pronargdefaults,
                     unnest(pg_catalog.pg_proc.proargnames) AS proargname,
                     unnest(pg_catalog.pg_proc.proargmodes) AS proargmode
                 FROM pg_catalog.pg_proc
                 INNER JOIN pg_catalog.pg_namespace ON (pg_catalog.pg_namespace.oid = pg_catalog.pg_proc.pronamespace)
-                WHERE (?::text IS NULL OR pg_catalog.pg_namespace.nspname = ?::text)
-                AND pg_catalog.pg_proc.proname = ?::text
+                WHERE (?::name IS NULL OR pg_catalog.pg_namespace.nspname = ?::name)
+                AND pg_catalog.pg_proc.proname = ?::name
                 AND pg_catalog.pg_proc.proargnames IS NOT NULL
                 AND pg_catalog.pg_proc.proargmodes IS NOT NULL
             ),
@@ -207,13 +295,15 @@ sub _proretset
                     oid,
                     proname,
                     proretset,
+                    pronargdefaults,
                     array_agg(proargname) AS proargnames
                 FROM NamedInputArgumentFunctions
                 WHERE proargmode IN ('i','b')
                 GROUP BY
                     oid,
                     proname,
-                    proretset
+                    proretset,
+                    pronargdefaults
                 UNION ALL
                 -- For functions with only IN arguments,
                 -- proargmodes IS NULL
@@ -221,38 +311,63 @@ sub _proretset
                     pg_catalog.pg_proc.oid,
                     pg_catalog.pg_proc.proname,
                     pg_catalog.pg_proc.proretset,
+                    pg_catalog.pg_proc.pronargdefaults,
                     pg_catalog.pg_proc.proargnames
                 FROM pg_catalog.pg_proc
                 INNER JOIN pg_catalog.pg_namespace ON (pg_catalog.pg_namespace.oid = pg_catalog.pg_proc.pronamespace)
-                WHERE (?::text IS NULL OR pg_catalog.pg_namespace.nspname = ?::text)
-                AND pg_catalog.pg_proc.proname = ?::text
+                WHERE (?::name IS NULL OR pg_catalog.pg_namespace.nspname = ?::name)
+                AND pg_catalog.pg_proc.proname = ?::name
                 AND pg_catalog.pg_proc.proargnames IS NOT NULL
                 AND pg_catalog.pg_proc.proargmodes IS NULL
             )
             -- Find any function matching the name
             -- and having identical argument names
             SELECT * FROM OnlyINandINOUTArguments
-            WHERE ?::text[] <@ proargnames AND ?::text[] @> proargnames
-            -- The order of arguments doesn't matter,
-            -- so compare the arrays by checking
-            -- if A contains B and B contains A
         ");
-        $get_proretset->execute($namespace, $namespace, $name, $namespace, $namespace, $name, $argnames, $argnames);
+        $get_proretset->execute($namespace, $namespace, $name, $namespace, $namespace, $name);
     }
-
 
     my $proretset;
-    my $i = 0;
+    my $found = 0;
     while (my $h = $get_proretset->fetchrow_hashref()) {
-        $i++;
-        $proretset = $h;
+        my $proargnames = $h->{proargnames} ? $h->{proargnames} : [];
+        my $pronargdefaults = $h->{pronargdefaults} ? $h->{pronargdefaults} : 0;
+        my %default_values = map { $_ => 1 } @$proargnames[@$proargnames - $pronargdefaults .. @$proargnames - 1];
+
+        # Check that the argument array is sane
+        my $arguments = 0;
+        if (@$proargnames > 0)
+        {
+            for my $argname (@$argnames)
+            {
+                if ($argname ~~ @$proargnames)
+                {
+                    $arguments++ if not exists $default_values{$argname};
+                }
+                else
+                {
+                    $arguments = 0;
+                    last;
+                }
+            }
+        }
+
+        if ($arguments == @$proargnames - $pronargdefaults)
+        {
+            $found++;
+            $proretset = $h;
+        }
     }
-    if ($i == 0)
+    if ($found == 0)
     {
         croak "no function matches the input arguments, function: $name";
     }
-    elsif ($i == 1)
+    elsif ($found == 1)
     {
+        # The function exists and can be called.  Add it to the cache if the
+        # caller has asked for caching.
+        $self->{proretset_cache}->{$cachekey} = $proretset->{proretset} if ($self->{EnableFunctionLookupCache});
+
         return $proretset->{proretset};
     }
     else
@@ -288,15 +403,56 @@ sub _call
         }
     }
 
-    my $placeholders = join ",", map { "$_ := ?" } @arg_names;
-
-    my $sql = 'SELECT * FROM ' . (defined $namespace ? "$namespace.$name" : $name) . '(' . $placeholders . ');';
-
     my $proretset = $self->_proretset($name, \@arg_names, $namespace);
+
+    my $placeholders = join ",", map { "$_ := ?" } @arg_names;
+    my $sql = 'SELECT * FROM ' . (defined $namespace ? "$namespace.$name" : $name) . '(' . $placeholders . ');';
 
     local $self->{dbh}->{RaiseError} = 0;
     my $query = $self->{dbh}->prepare($sql);
-    $query->execute(@arg_values) or croak "Call to $name failed: $DBI::errstr";
+
+
+	# reset the error information
+	$self->{SQLState} = '00000';
+	$self->{SQLErrorMessage} = undef;
+
+	my $failed = !defined $query->execute(@arg_values);
+
+    # If something went wrong, we might have to invalidate the cache entry for
+    # this function.
+    if ($failed && $self->{EnableFunctionLookupCache})
+    {
+        # List of SQLSTATEs that warrant cache invalidation.  See
+        # _invalidate_proretset_cache_entry() for more information and
+        # http://www.postgresql.org/docs/current/static/errcodes-appendix.html
+        # for a list of error codes.
+        #
+        # Unfortunately there is no way to reliably tell whether our call or
+        # something in the function we called caused the error.  However, for
+        # our use case it doesn't really matter since in the worst case that
+        # would only mean unnecessary invalidations for functions that are
+        # already slow to run because they're broken.
+        my @sqlstates = (
+                            "42883", # undefined function
+                            "42725"  # ambiguous function
+                        );
+
+        $self->_invalidate_proretset_cache_entry($name, \@arg_names, $namespace)
+            if ((scalar grep { $_ eq $query->state } @sqlstates) > 0);
+    }
+
+
+	if ($failed && $self->{RaiseError})
+	{
+		croak "Call to $name failed: $DBI::errstr";
+	}
+	elsif ($failed)
+	{
+		# if we failed but RaiseError wasn't set, let the caller deal with the problem
+		$self->{SQLState} = $query->state;
+		$self->{SQLErrorMessage} = $query->errstr;
+		return undef;
+	}
 
     my $output;
     my $num_cols;

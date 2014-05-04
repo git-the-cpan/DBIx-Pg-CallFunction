@@ -6,8 +6,20 @@ use warnings;
 use DBI;
 use DBD::Pg;
 use DBIx::Pg::CallFunction;
+use DBIx::Connector;
+use Time::HiRes;
 use JSON;
 use Plack::Request;
+
+# DBIx::Connector allows us to safely reuse connections by making sure that we
+# don't reuse DBI connections we inherited from our parent process after a
+# fork().
+my $dbconn = DBIx::Connector->new("dbi:Pg:service=pg_proc_jsonrpc", '', '', {pg_enable_utf8 => 1});
+
+# We can simply pass undef as the database handle since we set it for every
+# request anyway.  Additionally, enable the lookup cache to avoid unnecessary
+# database roundtrips.
+my $pg = DBIx::Pg::CallFunction->new(undef, {RaiseError => 0, EnableFunctionLookupCache => 1});
 
 my $app = sub {
     my $env = shift;
@@ -25,7 +37,7 @@ my $app = sub {
         }, {pretty => 1}) ]
     ];
 
-    my ($method, $params, $id, $version, $jsonrpc);
+    my ($method, $params, $id, $version);
     if ($env->{REQUEST_METHOD} eq 'GET') {
         my $req = Plack::Request->new($env);
         $method = $req->path_info;
@@ -33,10 +45,11 @@ my $app = sub {
         $params = $req->query_parameters->mixed;
 
     } elsif ($env->{REQUEST_METHOD} eq 'POST' &&
-        $env->{HTTP_ACCEPT} eq 'application/json' &&
+        $env->{HTTP_ACCEPT} =~ m!application/json! &&
         $env->{CONTENT_TYPE} =~ m!^application/json!
     ) {
         my $json_input;
+        my $jsonrpc;
         $env->{'psgi.input'}->read($json_input, $env->{CONTENT_LENGTH});
         my $json_rpc_request = from_json($json_input);
 
@@ -45,6 +58,26 @@ my $app = sub {
         $id      = $json_rpc_request->{id};
         $version = $json_rpc_request->{version};
         $jsonrpc = $json_rpc_request->{jsonrpc};
+
+        # must be version 2.0 if "jsonrpc" is defined
+        if (defined $jsonrpc)
+        {
+            return $invalid_request if ($jsonrpc ne '2.0');
+            return $invalid_request if (defined $version);
+            $version = '2.0';
+        }
+        
+        # assume 1.0 if "version" is not defined
+        if (!defined $version)
+        {
+            $version = 1.0;
+        }
+
+        if (!($version eq '1.0' || $version eq '1.1' || $version eq '2.0'))
+        {
+            # unsupported version
+            return $invalid_request;
+        }
     } else {
         return $invalid_request;
     }
@@ -61,24 +94,113 @@ my $app = sub {
     }
     my ($namespace, $function_name) = ($1, $2);
 
-    my $dbh = DBI->connect("dbi:Pg:service=pg_proc_jsonrpc", '', '', {pg_enable_utf8 => 1}) or die "unable to connect to PostgreSQL";
-    my $pg = DBIx::Pg::CallFunction->new($dbh);
-    my $result = $pg->$function_name($params, $namespace);
-    $dbh->disconnect;
+    my $dbh;
+
+    my $result;
+
+    my $error = undef;
+    my $success;
+
+    # A list of SQLSTATEs which, after failure, have a reasonably good chance
+    # of succeeding if retried.  See
+    # http://www.postgresql.org/docs/current/static/errcodes-appendix.html for
+    # a list of error codes.
+    my @retryable_sqlstates = (
+                                "40001", # serialization failure
+                                "40P01"  # deadlock
+                              );
+    $success = 0;
+    eval
+    {
+        # Ask for a connection from DBIx::Connector.  It is important to do this
+        # inside the  eval  in case the connection attempt fails so we can catch
+        # the error message and send that to the client.  Note: it is important
+		# to use _dbh instead of dbh here because of reasons explained below.
+        $dbh = $dbconn->dbh;
+		# if there's no connection, we're done
+		die $DBI::errstr if (!defined($dbh));
+        $pg->set_dbh($dbh);
+
+		# $dbconn->dbh calls $dbh->ping() every time, and there's no reason to do
+		# that, so we do the following instead: we keep getting the connection
+		# from _dbh so long as queries work correctly on that connection.  If,
+		# for some reason, a query does not work on that connection and we get
+		# back an SQLSTATE suggesting that the connection might be broken, we
+		# call dbh to go through the entire ping/reconnect procedure and retry
+		# the loop immediately.  Because we skip the delay, we only allow that
+		# to happen once per loop.
+		my $retried_connection = 0;
+
+        # loop until we hit an error we can't recover from
+        my $delay = 0.1;
+        while ($delay <= 3.0)
+        {
+            $result = $pg->$function_name($params, $namespace);
+
+			if (!$retried_connection &&
+					($pg->{SQLState} eq "08000" ||
+					 $pg->{SQLState} eq "57P01" ||
+					 $pg->{SQLState} eq "57P02"))
+			{
+				$retried_connection = 1;
+            	print STDERR "ERROR SQLSTATE $pg->{SQLState};  re-establishing connection\n";
+				$dbh = $dbconn->dbh;
+				$pg->set_dbh($dbh);
+				next;
+			}
+
+            # If the function succeeded but didn't return any results, $result
+            # will still be undef.  We need to check the actual SQLSTATE.
+            if ($pg->{SQLState} eq "00000")
+            {
+                $success = 1;
+                last;
+            }
+
+            # if there's no reason to assume that retrying would help, exit the loop
+            last if (scalar grep { $_ eq $pg->{SQLState} } @retryable_sqlstates) == 0;
+
+            # sleep for a while and then retry
+            print STDERR "ERROR SQLSTATE $pg->{SQLState};  retrying in $delay seconds\n";
+            Time::HiRes::sleep($delay);
+            $delay = $delay * 3;
+        }
+    };
+
+    # extract the appropriate error message if the function call didn't succeed
+    if ($@) {
+        $error = $@;
+    }
+    elsif (!$success) {
+        $error = $pg->{SQLErrorMessage};
+    }
 
     my $response = {
         result => $result,
-        error  => undef
+        error  => $error
     };
+
     if (defined $id) {
         $response->{id} = $id;
     }
-    if (defined $version && $version eq '1.1') {
+    if ($version eq '1.1') {
         $response->{version} = $version;
     }
-    if (defined $jsonrpc && $jsonrpc eq '2.0') {
-        $response->{jsonrpc} = $jsonrpc;
-        delete $response->{error};
+    if ($version eq '2.0') {
+        $response->{jsonrpc} = $version;
+    }
+
+    if ($version eq '1.1' || $version eq '2.0') {
+        # JSON-RPC 1.1 and 2.0 requires us to delete the "error" field on success and
+        # the "result" field on error.  Additionally, the "error" field is an object.
+        delete $response->{error} if ($success);
+
+        if (!$success)
+        {
+            delete $response->{result};
+            my $errobj = { code => -32000, message => $response->{error} };
+            $response->{error} = $errobj;
+        }
     }
 
     return [
@@ -123,6 +245,10 @@ Create database user for apache
 Download and build DBIx::Pg::CallFunction
 
   cpanm --sudo DBIx::Pg::CallFunction
+
+Download and build DBIx::Connector
+
+  cpanm --sudo DBIx::Pg::Connector
 
 Grant access to connect to our database
 
@@ -316,10 +442,11 @@ It only supports named parameters, JSON-RPC version 1.1 or 2.0.
 
 L<DBIx::Pg::CallFunction> is used to map
 method and params in the JSON-RPC call to the corresponding
-PostgreSQL stored procedure.
+PostgreSQL stored procedure.  DBIx::Connector is used to safely
+maintain database connections across requests.
 
 =head1 SEE ALSO
 
-L<plackup> L<Plack::Runner> L<PSGI|PSGI> L<DBIx::Pg::CallFunction>
+L<plackup> L<Plack::Runner> L<PSGI|PSGI> L<DBIx::Pg::CallFunction> L<DBIx::Connector>
 
 =cut
